@@ -8,8 +8,18 @@ on:
 jobs:
   sync-to-bookstack:
     runs-on: ubuntu-latest
-    if: github.event.issue.labels.*.name == 'knowledge-base'
+    # ИЗМЕНИЛИ: используем contains() вместо ==
+    if: contains(github.event.issue.labels.*.name, 'knowledge-base')
     steps:
+      - name: Debug - Show Labels
+        run: |
+          echo "=== DEBUG: Issue Information ==="
+          echo "Issue #${{ github.event.issue.number }}"
+          echo "Title: ${{ github.event.issue.title }}"
+          echo "Labels: ${{ toJson(github.event.issue.labels) }}"
+          echo "Label names: ${{ join(github.event.issue.labels.*.name, ', ') }}"
+          echo "Has 'knowledge-base' label: ${{ contains(github.event.issue.labels.*.name, 'knowledge-base') }}"
+
       - name: Checkout
         uses: actions/checkout@v3
 
@@ -18,8 +28,10 @@ jobs:
         with:
           node-version: '18'
 
-      - name: Install marked
-        run: npm install marked
+      - name: Install dependencies
+        run: |
+          npm install marked
+          sudo apt-get update && sudo apt-get install -y jq
 
       - name: Generate HTML from Markdown
         id: generate_html
@@ -30,32 +42,74 @@ jobs:
           
           node -e "
             const { marked } = require('marked');
-            const issueBody = process.env.ISSUE_BODY;
-            const html = marked.parse(issueBody || '');
+            const issueBody = process.env.ISSUE_BODY || '';
+            const html = marked.parse(issueBody);
             console.log('HTML_CONTENT=' + encodeURIComponent(html));
           " >> $GITHUB_ENV
+
+      - name: Get Book ID for "Githab Issues"
+        id: get_book_id
+        env:
+          API_ID: ${{ secrets.BOOKSTACK_API_ID }}
+          API_SECRET: ${{ secrets.BOOKSTACK_API_SECRET }}
+          BOOKSTACK_URL: ${{ secrets.BOOKSTACK_URL }}
+        run: |
+          echo "Получаем ID книги 'Githab Issues'..."
+          
+          # Получаем список всех книг
+          response=$(curl -s -X GET "$BOOKSTACK_URL/api/books" \
+            -H "Authorization: Token $API_ID:$API_SECRET")
+          
+          echo "API Response: $response"
+          
+          # Ищем книгу по имени
+          book_id=$(echo $response | jq -r '.data[] | select(.name == "Githab Issues") | .id')
+          
+          if [ -z "$book_id" ]; then
+            echo "❌ Книга 'Githab Issues' не найдена!"
+            echo "Создаем новую книгу..."
+            
+            create_response=$(curl -s -X POST "$BOOKSTACK_URL/api/books" \
+              -H "Authorization: Token $API_ID:$API_SECRET" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "name": "Githab Issues",
+                "description": "GitHub Issues synchronized via KCS"
+              }')
+            
+            book_id=$(echo $create_response | jq -r '.id')
+            echo "✅ Создана новая книга с ID: $book_id"
+          else
+            echo "✅ Найдена книга 'Githab Issues' с ID: $book_id"
+          fi
+          
+          echo "BOOK_ID=$book_id" >> $GITHUB_OUTPUT
 
       - name: Create or Update BookStack Page
         env:
           API_ID: ${{ secrets.BOOKSTACK_API_ID }}
           API_SECRET: ${{ secrets.BOOKSTACK_API_SECRET }}
           BOOKSTACK_URL: ${{ secrets.BOOKSTACK_URL }}
-          BOOK_ID: ${{ secrets.BOOKSTACK_BOOK_ID }}
         run: |
+          BOOK_ID=${{ steps.get_book_id.outputs.BOOK_ID }}
+          
+          echo "Используем Book ID: $BOOK_ID"
+          
           # Определяем статус
-          STATUS=""
           if [ "${{ github.event.action }}" = "closed" ]; then
-            STATUS="Решено"
+            STATUS="✅ Решено"
           elif [ "${{ github.event.action }}" = "reopened" ]; then
-            STATUS="В работе"
+            STATUS="🔄 В работе"
           else
-            STATUS="В работе"
+            STATUS="🔄 В работе"
           fi
           
           # Формируем контент
           CONTENT="<p><strong>GitHub Issue:</strong> <a href='${{ github.event.issue.html_url }}'>#${{ github.event.issue.number }}</a></p>"
-          CONTENT="$CONTENT<div>${{ env.HTML_CONTENT }}</div>"
+          CONTENT="$CONTENT<div>$HTML_CONTENT</div>"
           CONTENT="$CONTENT<p><strong>Статус:</strong> $STATUS</p>"
+          
+          echo "Ищем существующую страницу..."
           
           # Проверяем существование страницы
           EXISTING_PAGE=$(curl -s -X GET "$BOOKSTACK_URL/api/pages?book_id=$BOOK_ID" \
@@ -63,23 +117,34 @@ jobs:
             | jq -r ".data[] | select(.name == \"${{ github.event.issue.title }}\") | .id")
           
           if [ -z "$EXISTING_PAGE" ]; then
-            # Создаем новую страницу
+            echo "Создаем новую страницу: ${{ github.event.issue.title }}"
+            
+            # Экранируем кавычки для JSON
+            ESCAPED_CONTENT=$(echo "$CONTENT" | sed 's/"/\\"/g')
+            
             curl -X POST "$BOOKSTACK_URL/api/pages" \
               -H "Authorization: Token $API_ID:$API_SECRET" \
               -H "Content-Type: application/json" \
               -d "{
                 \"name\": \"${{ github.event.issue.title }}\",
                 \"book_id\": $BOOK_ID,
-                \"html\": \"$CONTENT\",
-                \"tags\": [{\"name\":\"github\", \"value\":\"issue-${{ github.event.issue.number }}\"}]
-              }"
+                \"html\": \"$ESCAPED_CONTENT\",
+                \"tags\": [
+                  {\"name\": \"github\", \"value\": \"issue-${{ github.event.issue.number }}\"},
+                  {\"name\": \"source\", \"value\": \"github-actions\"}
+                ]
+              }" && echo "✅ Страница создана успешно" || echo "❌ Ошибка при создании"
           else
-            # Обновляем существующую страницу
+            echo "Обновляем существующую страницу ID: $EXISTING_PAGE"
+            
+            # Экранируем кавычки для JSON
+            ESCAPED_CONTENT=$(echo "$CONTENT" | sed 's/"/\\"/g')
+            
             curl -X PUT "$BOOKSTACK_URL/api/pages/$EXISTING_PAGE" \
               -H "Authorization: Token $API_ID:$API_SECRET" \
               -H "Content-Type: application/json" \
               -d "{
                 \"name\": \"${{ github.event.issue.title }}\",
-                \"html\": \"$CONTENT\"
-              }"
+                \"html\": \"$ESCAPED_CONTENT\"
+              }" && echo "✅ Страница обновлена" || echo "❌ Ошибка при обновлении"
           fi
