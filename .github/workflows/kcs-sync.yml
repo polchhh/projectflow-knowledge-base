@@ -1,0 +1,85 @@
+name: KCS Knowledge Base Sync
+on:
+  issues:
+    types: [opened, edited, closed, reopened]
+  issue_comment:
+    types: [created]
+
+jobs:
+  sync-to-bookstack:
+    runs-on: ubuntu-latest
+    if: github.event.issue.labels.*.name == 'knowledge-base'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install marked
+        run: npm install marked
+
+      - name: Generate HTML from Markdown
+        id: generate_html
+        run: |
+          echo "ISSUE_BODY<<EOF" >> $GITHUB_ENV
+          echo "${{ github.event.issue.body }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
+          node -e "
+            const { marked } = require('marked');
+            const issueBody = process.env.ISSUE_BODY;
+            const html = marked.parse(issueBody || '');
+            console.log('HTML_CONTENT=' + encodeURIComponent(html));
+          " >> $GITHUB_ENV
+
+      - name: Create or Update BookStack Page
+        env:
+          API_ID: ${{ secrets.BOOKSTACK_API_ID }}
+          API_SECRET: ${{ secrets.BOOKSTACK_API_SECRET }}
+          BOOKSTACK_URL: ${{ secrets.BOOKSTACK_URL }}
+          BOOK_ID: ${{ secrets.BOOKSTACK_BOOK_ID }}
+        run: |
+          # Определяем статус
+          STATUS=""
+          if [ "${{ github.event.action }}" = "closed" ]; then
+            STATUS="Решено"
+          elif [ "${{ github.event.action }}" = "reopened" ]; then
+            STATUS="В работе"
+          else
+            STATUS="В работе"
+          fi
+          
+          # Формируем контент
+          CONTENT="<p><strong>GitHub Issue:</strong> <a href='${{ github.event.issue.html_url }}'>#${{ github.event.issue.number }}</a></p>"
+          CONTENT="$CONTENT<div>${{ env.HTML_CONTENT }}</div>"
+          CONTENT="$CONTENT<p><strong>Статус:</strong> $STATUS</p>"
+          
+          # Проверяем существование страницы
+          EXISTING_PAGE=$(curl -s -X GET "$BOOKSTACK_URL/api/pages?book_id=$BOOK_ID" \
+            -H "Authorization: Token $API_ID:$API_SECRET" \
+            | jq -r ".data[] | select(.name == \"${{ github.event.issue.title }}\") | .id")
+          
+          if [ -z "$EXISTING_PAGE" ]; then
+            # Создаем новую страницу
+            curl -X POST "$BOOKSTACK_URL/api/pages" \
+              -H "Authorization: Token $API_ID:$API_SECRET" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"name\": \"${{ github.event.issue.title }}\",
+                \"book_id\": $BOOK_ID,
+                \"html\": \"$CONTENT\",
+                \"tags\": [{\"name\":\"github\", \"value\":\"issue-${{ github.event.issue.number }}\"}]
+              }"
+          else
+            # Обновляем существующую страницу
+            curl -X PUT "$BOOKSTACK_URL/api/pages/$EXISTING_PAGE" \
+              -H "Authorization: Token $API_ID:$API_SECRET" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"name\": \"${{ github.event.issue.title }}\",
+                \"html\": \"$CONTENT\"
+              }"
+          fi
